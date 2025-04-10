@@ -1,14 +1,18 @@
 import Hummingbird
+import HummingbirdCore
+import HummingbirdTLS
 import Logging
+import NIOSSL
+import HummingbirdWSCompression
+import HummingbirdWebSocket
 
-/// Application arguments protocol. We use a protocol so we can call
-/// `buildApplication` inside Tests as well as in the App executable. 
-/// Any variables added here also have to be added to `App` in App.swift and 
-/// `TestArguments` in AppTest.swift
+/// Application arguments protocol
 public protocol AppArguments {
     var hostname: String { get }
     var port: Int { get }
     var logLevel: Logger.Level? { get }
+    var certPath: String { get }
+    var keyPath: String { get }
 }
 
 // Request context used by application
@@ -19,19 +23,52 @@ typealias AppRequestContext = BasicRequestContext
 public func buildApplication(_ arguments: some AppArguments) async throws -> some ApplicationProtocol {
     let environment = Environment()
     let logger = {
-        var logger = Logger(label: "{{HB_PACKAGE_NAME}}")
-        logger.logLevel = 
-            arguments.logLevel ??
-            environment.get("LOG_LEVEL").flatMap { Logger.Level(rawValue: $0) } ??
-            .info
+        var logger = Logger(label: "testhu")
+        logger.logLevel = .trace
         return logger
     }()
+
+    let wsRouter = Router(context: BasicWebSocketRequestContext.self)
+
+    wsRouter.middlewares.add(LogRequestsMiddleware(.debug))
+
+    wsRouter.ws("proxy") { request, _ in
+        print("Reachrd - upgrading")
+        return .upgrade([:])
+    } onUpgrade: { (inbound: WebSocketInboundStream, outbound: WebSocketOutboundWriter, context) in
+        try await outbound.write(.text("HELLO: Server to client"))
+
+        for try await input in inbound.messages(maxSize: 1_000_000) {
+            print("Server received: \(input)")
+            // Only process one message, and exit
+            break
+        }
+        try await outbound.write(.text("Server to client"))
+
+    }
+    // Load SSL certificates
+    let certificateChain = try NIOSSLCertificate.fromPEMFile(arguments.certPath)
+    let privateKey = try NIOSSLPrivateKey(file: arguments.keyPath, format: .pem)
+
+    // Create TLS configuration
+    var tlsConfiguration = TLSConfiguration.makeServerConfiguration(
+        certificateChain: certificateChain.map { .certificate($0) },
+        privateKey: .privateKey(privateKey)
+    )
+    tlsConfiguration.certificateVerification = .none
+
     let router = buildRouter()
-    let app = Application(
+    let app = try Application(
         router: router,
+        //server: .tls(tlsConfiguration: tlsConfiguration),
+        server: .tls(
+            .http1WebSocketUpgrade(
+                webSocketRouter: wsRouter,
+                configuration: .init(extensions: [.perMessageDeflate()])
+            ),
+            tlsConfiguration: tlsConfiguration),
         configuration: .init(
-            address: .hostname(arguments.hostname, port: arguments.port),
-            serverName: "{{HB_PACKAGE_NAME}}"
+            address: .hostname("localhost", port: arguments.port)
         ),
         logger: logger
     )
